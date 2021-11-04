@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 import torch
-
+from .jet_dataset import ParticleJetDataset
 
 class UniformDataset(Dataset):
     """
@@ -37,6 +37,9 @@ def getRandomData(dataset='imagenet', batch_size=512, for_inception=False):
             size = (3, 224, 224)
         else:
             size = (3, 299, 299)
+    elif dataset == 'hls4ml_lhc_jets':
+        num_data = 10000
+        size = (16,)
     else:
         raise NotImplementedError
     dataset = UniformDataset(length=num_data, size=size, transform=None)
@@ -50,7 +53,8 @@ def getRandomData(dataset='imagenet', batch_size=512, for_inception=False):
 def getTestData(dataset='imagenet',
                 batch_size=1024,
                 path='data/imagenet',
-                for_inception=False):
+                for_inception=False,
+                num_workers=32):
     """
     Get dataloader of testset 
     dataset: name of the dataset 
@@ -75,8 +79,14 @@ def getTestData(dataset='imagenet',
         test_loader = DataLoader(test_dataset,
                                  batch_size=batch_size,
                                  shuffle=False,
-                                 num_workers=32)
+                                 num_workers=num_workers)
 
+        return test_loader
+    elif dataset == 'hls4ml_lhc_jets':
+        # Set Batch size and split value
+        test_dataset = ParticleJetDataset(path)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size,
+                                                  shuffle=False, num_workers=num_workers)
         return test_loader
     elif dataset == 'cifar10':
         data_dir = '/rscratch/yaohuic/data/'
@@ -90,7 +100,7 @@ def getTestData(dataset='imagenet',
         test_loader = DataLoader(test_dataset,
                                  batch_size=batch_size,
                                  shuffle=False,
-                                 num_workers=32)
+                                 num_workers=num_workers)
         return test_loader
 
 
@@ -98,7 +108,9 @@ def getTrainData(dataset='imagenet',
                 batch_size=512,
                 path='data/imagenet',
                 for_inception=False,
-                data_percentage=0.1):
+                data_percentage=0.1,
+                num_workers=32,
+                dist_sampler=False):
     """
     Get dataloader of training
     dataset: name of the dataset
@@ -122,10 +134,58 @@ def getTrainData(dataset='imagenet',
             ]))
 
         dataset_length = int(len(train_dataset) * data_percentage)
-        partial_train_dataset, _ = torch.utils.data.random_split(train_dataset, [dataset_length, len(train_dataset)-dataset_length])
+        partial_train_dataset, _ = torch.utils.data.random_split(train_dataset,
+                                                                 [dataset_length, len(train_dataset)-dataset_length])
+
+        if dist_sampler:
+            sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        else:
+            sampler = None
 
         train_loader = torch.utils.data.DataLoader(
-            partial_train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=32, pin_memory=True)
+            partial_train_dataset, batch_size=batch_size, shuffle=(sampler is None),
+            num_workers=num_workers, pin_memory=True, sampler=sampler)
 
         return train_loader
+    elif dataset == "hls4ml_lhc_jets":
+        train_dataset = ParticleJetDataset(path)
+        dataset_length = int(len(train_dataset) * data_percentage)
+        partial_train_dataset, validation_train_dataset = torch.utils.data.random_split(train_dataset,
+                                                                 [dataset_length, len(train_dataset)-dataset_length])
+        if dist_sampler:
+            sampler = torch.utils.data.distributed.DistributedSampler(partial_train_dataset)
+            v_sampler = torch.utils.data.distributed.DistributedSampler(validation_train_dataset)
+        else:
+            sampler = None
+            v_sampler = None
+
+        train_loader = torch.utils.data.DataLoader(partial_train_dataset, batch_size=batch_size,
+                                                   shuffle=(sampler is None), num_workers=num_workers,
+                                                   pin_memory=True, sampler=sampler)
+        validation_loader = torch.utils.data.DataLoader(validation_train_dataset, batch_size=batch_size,
+                                                        shuffle=(v_sampler is None),num_workers=num_workers,
+                                                        pin_memory=True, sampler=v_sampler)
+        return train_loader#, validation_loader
+
+def getDataloaders(dataset, train_path, test_path, batch_size=1024,num_workers=32,data_percentage=0.75,for_inception=False, dist_sampler=False):
+
+    train_loader = getTrainData(dataset=dataset,
+                 batch_size=batch_size,
+                 path=train_path,
+                 for_inception=for_inception,
+                 data_percentage=data_percentage,
+                 num_workers=num_workers,
+                 dist_sampler=dist_sampler)
+
+    test_loader = getTestData(dataset=dataset,
+                batch_size=batch_size,
+                path=test_path,
+                for_inception=for_inception,
+                num_workers=num_workers)
+    try:
+        train_sampler = train_loader.sampler
+    except:
+        train_sampler = None
+
+    return train_loader, test_loader, train_sampler
+

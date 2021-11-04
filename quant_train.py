@@ -5,6 +5,7 @@ import shutil
 import time
 import logging
 import warnings
+import json
 
 import torch
 import torch.nn as nn
@@ -19,9 +20,13 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+import utils.models.q_jettagger
 from bit_config import *
 from utils import *
 from pytorchcv.model_provider import get_model as ptcv_get_model
+
+from sklearn.metrics import top_k_accuracy_score, accuracy_score
+import train_funcs
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('--data', metavar='DIR',
@@ -150,12 +155,15 @@ parser.add_argument('--fixed-point-quantization',
                     action='store_true',
                     help='whether to skip deployment-oriented operations and '
                          'use fixed-point rather than integer-only quantization')
-
+parser.add_argument('--critoptoverride',
+                    action='store_true',
+                    help='hls4ml criterion and optimizer overrides (temp, shouldnt leave this)')
 best_acc1 = 0
 quantize_arch_dict = {'resnet50': q_resnet50, 'resnet50b': q_resnet50,
                       'resnet18': q_resnet18, 'resnet101': q_resnet101,
                       'inceptionv3': q_inceptionv3,
-                      'mobilenetv2_w1': q_mobilenetv2_w1}
+                      'mobilenetv2_w1': q_mobilenetv2_w1,
+                      'hls4ml_jettagger': utils.models.q_jettagger.q_jettagger_model}
 args = parser.parse_args()
 if not os.path.exists(args.save_path):
     os.makedirs(args.save_path)
@@ -230,10 +238,14 @@ def main_worker(gpu, ngpus_per_node, args):
             teacher = ptcv_get_model(args.teacher_arch, pretrained=True)
     else:
         logging.info("=> creating PyTorchCV model '{}'".format(args.arch))
-        model = ptcv_get_model(args.arch, pretrained=False)
-        if args.distill_method != 'None':
-            logging.info("=> creating PyTorchCV teacher '{}'".format(args.teacher_arch))
-            teacher = ptcv_get_model(args.teacher_arch, pretrained=False)
+        try:
+            model = ptcv_get_model(args.arch, pretrained=False)
+            if args.distill_method != 'None':
+                logging.info("=> creating PyTorchCV teacher '{}'".format(args.teacher_arch))
+                teacher = ptcv_get_model(args.teacher_arch, pretrained=False)
+        except:
+            logging.info("=> Warning!! No PytorchCV Model found with arch '{}', assuming local model... (no dist support!!) ".format(args.arch))
+            model, teacher = None, None
 
     if args.resume and not args.resume_quantize:
         if os.path.isfile(args.resume):
@@ -258,8 +270,10 @@ def main_worker(gpu, ngpus_per_node, args):
             logging.info("=> no checkpoint found at '{}'".format(args.resume))
 
     quantize_arch = quantize_arch_dict[args.arch]
-
     model = quantize_arch(model)
+
+    #this might explode things? idk
+    #model.double()
 
     bit_config = bit_config_dict["bit_config_" + args.arch + "_" + args.quant_scheme]
     name_counter = 0
@@ -360,11 +374,15 @@ def main_worker(gpu, ngpus_per_node, args):
                 teacher = torch.nn.DataParallel(teacher).cuda()
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    if args.critoptoverride:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        criterion = nn.BCELoss().cuda(args.gpu)
+    else:
+        criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+        optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
 
     # optionally resume optimizer and meta information from a checkpoint
     if args.resume:
@@ -388,62 +406,112 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
 
-    train_resolution = 224
-    if args.arch == "inceptionv3":
-        train_resolution = 299
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(train_resolution),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
 
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    if args.arch == "hls4ml_jettagger":
+        train_loader, val_loader, train_sampler = utils.getDataloaders("hls4ml_lhc_jets",
+                                                            train_path="datasets/hls4ml_lhc_jets/train",
+                                                            test_path="datasets/hls4ml_lhc_jets/test",
+                                                            dist_sampler=args.distributed,
+                                                            num_workers=1)
     else:
-        train_sampler = None
+        train_resolution = 224
+        if args.arch == "inceptionv3":
+            train_resolution = 299
+        # Data loading code
+        traindir = os.path.join(args.data, 'train')
+        valdir = os.path.join(args.data, 'val')
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            transforms.Compose([
+                transforms.RandomResizedCrop(train_resolution),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]))
 
-    dataset_length = int(len(train_dataset) * args.data_percentage)
-    if args.data_percentage == 1:
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-    else:
-        partial_train_dataset, _ = torch.utils.data.random_split(train_dataset,
-                                                                 [dataset_length, len(train_dataset) - dataset_length])
-        train_loader = torch.utils.data.DataLoader(
-            partial_train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        if args.distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        else:
+            train_sampler = None
 
-    test_resolution = (256, 224)
-    if args.arch == 'inceptionv3':
-        test_resolution = (342, 299)
+        dataset_length = int(len(train_dataset) * args.data_percentage)
+        if args.data_percentage == 1:
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        else:
+            partial_train_dataset, _ = torch.utils.data.random_split(train_dataset,
+                                                                     [dataset_length,
+                                                                      len(train_dataset) - dataset_length])
+            train_loader = torch.utils.data.DataLoader(
+                partial_train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
-    # evaluate on validation set
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(test_resolution[0]),
-            transforms.CenterCrop(test_resolution[1]),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+        test_resolution = (256, 224)
+        if args.arch == 'inceptionv3':
+            test_resolution = (342, 299)
+
+        # evaluate on validation set
+        val_loader = torch.utils.data.DataLoader(
+            datasets.ImageFolder(valdir, transforms.Compose([
+                transforms.Resize(test_resolution[0]),
+                transforms.CenterCrop(test_resolution[1]),
+                transforms.ToTensor(),
+                normalize,
+            ])),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
 
     best_epoch = 0
+    '''
+    for epoch in range(args.start_epoch, args.epochs):
+        train_loss_meter = AverageMeter('Train Loss', ':.4e')
+        val_loss_meter = AverageMeter('Valid Loss', ':.4e')
+        top1 = AverageMeter('Acc@1', ':6.2f')
+
+
+        model, train_losses = train_funcs.train(model, optimizer, criterion, train_loader, L1_factor=0,device='cuda:0')
+
+        # Validate
+        val_losses, val_avg_acc_list, val_roc_auc_scores_list = train_funcs.val(model, criterion, val_loader,
+                                                                          L1_factor=0,device='cuda:0')
+
+        # Calculate average epoch statistics
+        try:
+            train_loss = np.average(train_losses)
+        except:
+            train_loss = torch.mean(torch.stack(train_losses)).cpu().numpy()
+
+        try:
+            valid_loss = np.average(val_losses)
+        except:
+            valid_loss = torch.mean(torch.stack(val_losses)).cpu().numpy()
+
+        val_roc_auc_score = np.average(val_roc_auc_scores_list)
+        val_avg_acc = np.average(val_avg_acc_list)
+
+        train_loss_meter.update(train_loss.tolist(),epoch+1)
+        val_loss_meter.update(valid_loss.tolist(),epoch+1)
+        top1.update(val_avg_acc,epoch+1)
+
+        print('[epoch %d] train batch loss: %.7f' % (epoch + 1, train_loss))
+        print('[epoch %d] val batch loss: %.7f' % (epoch + 1, valid_loss))
+        print('[epoch %d] val ROC AUC Score: %.7f' % (epoch + 1, val_roc_auc_score))
+        print('[epoch %d] val Avg Acc Score: %.7f' % (epoch + 1, val_avg_acc))
+
+
+    '''
+    #'''
+    loss_record = list()
+    acc_record = list()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -454,9 +522,12 @@ def main_worker(gpu, ngpus_per_node, args):
             train_kd(train_loader, model, teacher, criterion, optimizer, epoch, val_loader,
                      args, ngpus_per_node, dataset_length)
         else:
-            train(train_loader, model, criterion, optimizer, epoch, args)
+            epoch_loss = train(train_loader, model, criterion, optimizer, epoch, args)
 
         acc1 = validate(val_loader, model, criterion, args)
+
+        loss_record.append(epoch_loss)
+        acc_record.append(acc1)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -479,6 +550,15 @@ def main_worker(gpu, ngpus_per_node, args):
                 'best_acc1': best_acc1,
                 'optimizer': optimizer.state_dict(),
             }, is_best, args.save_path)
+    filename = 'model_losses_{}_{}.json'.format(args.arch,args.quant_scheme)
+    with open(os.path.join(args.save_path, filename), 'w') as fp:
+        json.dump(loss_record, fp)
+    filename = 'model_acc_{}_{}.json'.format(args.arch,args.quant_scheme)
+    with open(os.path.join(args.save_path, filename), 'w') as fp:
+        json.dump(acc_record, fp)
+    import post_train_plots
+    post_train_plots.plot_total_loss([model],[loss_record],[[best_epoch]])
+    post_train_plots.plot_total_acc([model], [acc_record], [[best_epoch]])
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -486,10 +566,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+    #top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, losses, top1],#, top5],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
@@ -508,14 +588,24 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(images)
-        loss = criterion(output, target)
+        output = model(images.float())
+        loss = criterion(output, target.float())
+
+        #print(target.size())
+        #print(np.argmax(output.cpu(), axis=1).size())
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        #images = images.cpu().numpy()
+        #target = target.cpu().numpy()
+        #output = output.cpu().numpy()
+        #_, preds = torch.max(output, 1)
+        #truth = torch.max(target, 1)[1].view(-1).cpu()
+        #acc1 = accuracy_score(truth,preds.view(-1))
+        #acc5 = top_k_accuracy_score(target,output,k=5)
+        #acc1, acc5 = accuracy(output, target, topk=(1,))#, 5))
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        #top1.update(acc1, images.size(0))
+        #top5.update(acc5, images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -528,7 +618,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
-
+    return losses.avg
 
 def train_kd(train_loader, model, teacher, criterion, optimizer, epoch, val_loader, args, ngpus_per_node,
              dataset_length):
@@ -567,6 +657,7 @@ def train_kd(train_loader, model, teacher, criterion, optimizer, epoch, val_load
 
         if args.distill_method == 'None':
             loss = criterion(output, target)
+            loss += train_funcs.l1_regularizer(model)
         elif args.distill_method == 'KD_naive':
             loss = loss_kd(output, target, teacher_output, args)
         else:
@@ -636,6 +727,9 @@ def validate(val_loader, model, criterion, args):
     freeze_model(model)
     model.eval()
 
+    predlist = torch.zeros(0, dtype=torch.long, device='cpu')
+    lbllist = torch.zeros(0, dtype=torch.long, device='cpu')
+
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
@@ -644,22 +738,30 @@ def validate(val_loader, model, criterion, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output = model(images)
-            loss = criterion(output, target)
+            output = model(images.float())
+            loss = criterion(output, target.float())
 
             # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            #acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
+            #top1.update(acc1[0], images.size(0))
+            #top5.update(acc5[0], images.size(0))
 
+            _, preds = torch.max(output, 1)
+            #print(target.size())
+            predlist = torch.cat([predlist, preds.view(-1).cpu()])
+            lbllist = torch.cat([lbllist, torch.max(target, 1)[1].view(-1).cpu()])
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
 
             if i % args.print_freq == 0:
                 progress.display(i)
-
+        outputs = output.cpu()
+        local_labels = target.cpu()
+        predict_test = outputs.numpy()
+        accuracy_value = accuracy_score(np.nan_to_num(lbllist.numpy()), np.nan_to_num(predlist.numpy()))
+        top1.update(accuracy_value, 1)
         logging.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
 
     torch.save({'convbn_scaling_factor': {k: v for k, v in model.state_dict().items() if 'convbn_scaling_factor' in k},
@@ -668,16 +770,22 @@ def validate(val_loader, model, criterion, args):
                 'bias_integer': {k: v for k, v in model.state_dict().items() if 'bias_integer' in k},
                 'act_scaling_factor': {k: v for k, v in model.state_dict().items() if 'act_scaling_factor' in k},
                 }, args.save_path + 'quantized_checkpoint.pth.tar')
-
+    torch.save({'convbn_scaling_factor': {k: v for k, v in model.state_dict().items() if 'convbn_scaling_factor' in k},
+                'fc_scaling_factor': {k: v for k, v in model.state_dict().items() if 'fc_scaling_factor' in k},
+                'weight_integer': {k: v for k, v in model.state_dict().items() if 'weight_integer' in k},
+                'bias_integer': {k: v for k, v in model.state_dict().items() if 'bias_integer' in k},
+                'act_scaling_factor': {k: v for k, v in model.state_dict().items() if 'act_scaling_factor' in k},
+                }, args.save_path + 'quantized_checkpoint.pth')
     unfreeze_model(model)
 
-    return top1.avg
+    return accuracy_value #top1.avg
 
 
 def save_checkpoint(state, is_best, filename=None):
     torch.save(state, filename + 'checkpoint.pth.tar')
     if is_best:
         shutil.copyfile(filename + 'checkpoint.pth.tar', filename + 'model_best.pth.tar')
+
 
 
 class AverageMeter(object):
@@ -687,6 +795,7 @@ class AverageMeter(object):
         self.name = name
         self.fmt = fmt
         self.reset()
+        self.list = list()
 
     def reset(self):
         self.val = 0
@@ -699,6 +808,7 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+        self.list.append((self.val,self.count))
 
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
@@ -737,8 +847,10 @@ def accuracy(output, target, topk=(1,)):
         batch_size = target.size(0)
 
         _, pred = output.topk(maxk, 1, True, True)
+        pred.t()
         pred = pred.t()
         correct = pred.eq(target.view(1, -1).expand_as(pred))
+        #correct = pred.eq(target.t().expand_as(pred))
 
         res = []
         for k in topk:

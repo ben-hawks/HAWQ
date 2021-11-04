@@ -1,4 +1,12 @@
 *~
+#Output & Dataset Files
+checkpoints/
+datasets/
+
+#Pycharm Files
+.idea/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

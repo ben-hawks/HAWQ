@@ -1,4 +1,21 @@
 bit_config_dict = {
+"bit_config_hls4ml_jettagger_uniform8" : {
+'quant_input': 8,
+'quant_act_int32': 16,
+
+'feautres.fc1.weight': 8,
+'feautres.fc1.bias': 8,
+'feautres.act1': 8,
+
+'feautres.fc2': 8,
+'feautres.act2': 8,
+
+'feautres.fc3': 8,
+'feautres.act3': 8,
+
+'feautres.act4': 8
+# softmax layer?
+},
 
 "bit_config_resnet18_uniform8" : {
 'quant_input': 8,
